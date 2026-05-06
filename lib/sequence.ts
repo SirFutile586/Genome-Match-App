@@ -1,4 +1,5 @@
 import { iupacToRegex, validateMotif } from './iupac';
+import { designPrimerPairs, PrimerPair, SYBR_DEFAULTS } from './primer';
 
 export interface MotifMatch {
   position: number;     // 0-indexed start within the window
@@ -6,6 +7,8 @@ export interface MotifMatch {
   matched: string;      // the actual matched substring
   contextBefore: string;
   contextAfter: string;
+  /** ChIP-qPCR / SYBR Green primer candidates (up to 3) targeting this match. */
+  primers: PrimerPair[];
 }
 
 export interface MotifSearchOptions {
@@ -42,12 +45,14 @@ export function findMotifMatches(
   while ((m = re.exec(upper)) !== null) {
     const start = m.index;
     const end = start + m[0].length;
+    const primers = designPrimerPairs(upper, start, end, SYBR_DEFAULTS);
     out.push({
       position: start,
       end,
       matched: m[0],
       contextBefore: upper.slice(Math.max(0, start - before), start),
       contextAfter: upper.slice(end, Math.min(upper.length, end + after)),
+      primers,
     });
     // Defensive: avoid infinite loops on zero-width matches.
     if (m.index === re.lastIndex) re.lastIndex++;

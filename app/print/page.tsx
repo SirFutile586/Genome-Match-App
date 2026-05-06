@@ -1,55 +1,69 @@
+'use client';
+
+import { useEffect, useMemo, useState } from 'react';
 import { buildPrintHtml, ExportTab } from '@/lib/pdf';
 
-export const dynamic = 'force-dynamic';
-
-interface Props {
-  searchParams: { data?: string };
-}
-
 /**
- * Server-rendered print view. The frontend opens
- *   /print?data=<URI-encoded JSON of all tabs>
- * and the user uses the browser's "Save as PDF" (landscape) action to produce
- * the report. This is the Vercel-friendly alternative to running Puppeteer
- * inside a serverless function.
+ * Client-rendered print view.
+ *
+ * The frontend opens this route with either:
+ *   /print?token=<sessionStorage key>   (preferred — no URL length limit)
+ *   /print?data=<URI-encoded JSON>      (fallback when sessionStorage is unavailable)
+ *
+ * The user uses the browser's native "Save as PDF" (landscape) to produce
+ * the report. This replaces the previous server-rendered approach: server
+ * rendering broke for large promoter payloads because a multi-tab report
+ * with 10 kb windows blew past Vercel's edge URL/searchParam limits and
+ * the page would silently render empty. Reading from sessionStorage on the
+ * client avoids that limit entirely.
  */
-export default function PrintPage({ searchParams }: Props) {
-  let tabs: ExportTab[] = [];
-  let parseError: string | null = null;
+export default function PrintPage() {
+  const [tabs, setTabs] = useState<ExportTab[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  if (searchParams?.data) {
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
     try {
-      const parsed = JSON.parse(decodeURIComponent(searchParams.data));
-      if (Array.isArray(parsed)) tabs = parsed;
+      const url = new URL(window.location.href);
+      const token = url.searchParams.get('token');
+      const data = url.searchParams.get('data');
+      let raw: string | null = null;
+      if (token) raw = sessionStorage.getItem(token);
+      else if (data) raw = decodeURIComponent(data);
+      if (!raw) {
+        setError('No data passed to /print. Open this page from the main app via Export.');
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed) || !parsed.length) {
+        setError('Empty payload — re-run a search and click Export again.');
+        return;
+      }
+      setTabs(parsed as ExportTab[]);
     } catch (e) {
-      parseError = (e as Error).message;
+      setError((e as Error).message);
     }
-  }
+  }, []);
 
-  if (parseError) {
+  const html = useMemo(() => (tabs ? buildPrintHtml(tabs) : ''), [tabs]);
+
+  if (error) {
     return (
       <div style={{ padding: 24, fontFamily: 'system-ui' }}>
         <h1>Could not render print view</h1>
-        <p style={{ color: '#b3261e' }}>{parseError}</p>
-        <p>Re-run the search and try Export PDF again.</p>
+        <p style={{ color: '#b3261e' }}>{error}</p>
+        <p>Re-run the search and try Export again.</p>
       </div>
     );
   }
-
-  if (!tabs.length) {
+  if (!tabs) {
     return (
       <div style={{ padding: 24, fontFamily: 'system-ui' }}>
-        <h1>Nothing to print</h1>
-        <p>Open this page from the Export PDF button in the main app.</p>
+        <p>Loading print view…</p>
       </div>
     );
   }
 
-  const html = buildPrintHtml(tabs);
-  // We render the full document body via dangerouslySetInnerHTML on a
-  // wrapping <div> so that <style> tags and the @page rule reach the browser
-  // exactly as authored — Next's outer html/body wrappers do not interfere
-  // with the inner @page directive.
   return (
     <div
       // eslint-disable-next-line react/no-danger
@@ -58,9 +72,7 @@ export default function PrintPage({ searchParams }: Props) {
   );
 }
 
-/** Strip outer <html>/<head>/<body> so we can reuse the shared HTML builder. */
 function extractBody(html: string): string {
-  // Pull the <style> block + <body> contents.
   const styleMatch = html.match(/<style>[\s\S]*?<\/style>/);
   const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/);
   const style = styleMatch ? styleMatch[0] : '';

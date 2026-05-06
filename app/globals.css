@@ -88,6 +88,9 @@ a { color: var(--accent); }
   border-radius: var(--radius);
   padding: 14px 16px;
 }
+.search-bar .export-group {
+  grid-column: auto;
+}
 .field { display: flex; flex-direction: column; gap: 4px; }
 .field label {
   font-size: 11px;
@@ -302,4 +305,79 @@ a { color: var(--accent); }
 @media (max-width: 900px) {
   .search-bar { grid-template-columns: 1fr 1fr; }
   .search-bar .btn { grid-column: span 2; }
+}
+
+.export-group {
+  display: flex;
+  gap: 6px;
+  align-items: end;
+}
+
+.motif-help {
+  margin-top: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  font-size: 12px;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+.motif-help strong { color: var(--ink); }
+.motif-help code {
+  font-family: var(--mono);
+  background: var(--surface-2);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11.5px;
+}
+
+.primer-block {
+  margin-top: 10px;
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+}
+.primer-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-2);
+  margin-bottom: 6px;
+}
+.primer-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+.primer-table th,
+.primer-table td {
+  border: 1px solid var(--line);
+  padding: 4px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+.primer-table th {
+  background: var(--surface-2);
+  font-weight: 600;
+  font-size: 10.5px;
+  color: var(--ink-2);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.primer-table code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  word-break: break-all;
+}
+.primer-table .primer-warn {
+  font-size: 10.5px;
+  color: #6a4a00;
+  font-style: italic;
+}
+.primer-empty {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--ink-3);
+  font-style: italic;
 }

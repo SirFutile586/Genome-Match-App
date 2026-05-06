@@ -27,12 +27,29 @@ the 10 kb upstream window from the pinned reference assembly.
   0–110 bp on each side; engine accepts up to 500 if you need more.
 - **Quick matches** view showing each hit with flanking context, position,
   bp-upstream coordinate, species, and a highlighted motif span.
+- **In-app ChIP-qPCR primer design (SYBR Green).** For every motif match
+  the app proposes 1–3 candidate primer pairs sized for SYBR-based qPCR
+  (defaults: amplicon 100–250 bp, primer 18–24 nt, Tm ≈ 60 °C, GC 40–60%,
+  rejected on extreme homopolymers / dinucleotide repeats / 3'-end
+  GC-clamp violations). Forward and reverse primers are returned in
+  standard 5'→3' order, the reverse already reverse-complemented. Each
+  pair lists amplicon size, both primer Tms (salt-adjusted formula), GCs,
+  and any heuristic warnings. **These are heuristic candidates only**:
+  validate with [Primer-BLAST](https://www.ncbi.nlm.nih.gov/tools/primer-blast/),
+  UCSC In-Silico PCR, and a wet-lab gradient before ordering.
 - **Sequence viewer** view showing the entire 10 kb window with every
   match `<mark>`-highlighted, formatted as 60 bp lines with position
   labels.
 - **Tabbed workflow** — every search opens a new tab; tabs can be closed
   individually.
-- **Export PDF** opens a print-ready landscape report at `/print`.
+- **Export PDF** has two modes:
+  - **Export current tab.** Opens a single-column landscape report for
+    the active gene/motif tab — every match with motif label, position,
+    species/source, highlighted context, and primer candidates.
+  - **Export all tabs.** Opens a landscape report where each open tab is
+    rendered as its own vertical column (up to 4 columns per page);
+    long tabs paginate onto additional pages with the column header
+    repeated above each new page so context is never lost.
 - **Sequence provenance panel** under every result lists assembly,
   chromosome accession, transcript accession + select category (or
   fallback reason), strand, TSS, fetched-at timestamp, and genomic
@@ -131,12 +148,13 @@ genome_match/
 │   └── SequenceViewer.tsx        # 60 bp lines with highlighted matches
 └── lib/
     ├── iupac.ts                  # IUPAC -> regex
-    ├── sequence.ts               # motif matcher + context windows
+    ├── sequence.ts               # motif matcher + context windows + primer attach
+    ├── primer.ts                 # ChIP-qPCR / SYBR Green primer pair picker
     ├── ncbi.ts                   # live NCBI Datasets + EFetch pipeline
     ├── fasta.ts                  # FASTA parser
     ├── genbank.ts                # GenBank feature parser
     ├── pipeline.ts               # combines NCBI + matcher per species
-    └── pdf.ts                    # builds the print-ready HTML report
+    └── pdf.ts                    # builds the print-ready HTML report (single + all-tabs)
 ```
 
 ## Local development
@@ -189,6 +207,43 @@ Instead the **Export PDF** button opens `/print` in a new tab; the page
 is pre-styled with `@page { size: A4 landscape }` and a column grid, so
 the user clicks *Print → Save as PDF (landscape)* to produce the
 report. The HTML builder in `lib/pdf.ts` is reusable.
+
+## ChIP-qPCR / SYBR Green primer design
+
+Defaults applied to every motif match (configurable in `lib/primer.ts`
+via the `SYBR_DEFAULTS` constant):
+
+| Parameter | Default |
+| --- | --- |
+| Amplicon size | **100–250 bp** (target ~175 bp) |
+| Primer length | **18–24 nt** |
+| Tm (approx.) | **57–63 °C**, target ~60 °C |
+| Max ΔTm between forward and reverse | **2.5 °C** |
+| GC content | **40–60 %** |
+| Inner gap (forward 3' to reverse 5') | ≥ 1 nt |
+| Pairs returned per match | up to **3**, scored and de-duplicated |
+
+Heuristic Tm formula: salt-free
+`Tm = 64.9 + 41 · (GC – 16.4) / length` for primers ≥ 14 nt, falling
+back to `4·GC + 2·AT` for shorter oligos. Forward primers are picked
+upstream of the motif on the displayed strand; reverse primers are
+picked downstream and returned reverse-complemented in standard
+ordering (5'→3' as you would order the oligo). Pairs are rejected when
+no candidate satisfies the amplicon-size or Tm-delta windows; the UI
+states "No SYBR-friendly primer pairs in 100–250 bp window around this
+match" in that case.
+
+**Limitations.** This is an in-app heuristic, not Primer3, and there is
+no specificity check against the rest of the genome. Always:
+
+1. Run each candidate pair through
+   [Primer-BLAST](https://www.ncbi.nlm.nih.gov/tools/primer-blast/) on
+   the matching organism before ordering.
+2. Verify amplicon uniqueness with UCSC In-Silico PCR.
+3. Run a Tm gradient and a no-template control in the wet lab.
+
+The candidate list is meant to short-circuit the "what would a primer
+even look like here?" step, not to replace expert design review.
 
 ## Caveats and limitations
 

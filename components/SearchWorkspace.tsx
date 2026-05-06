@@ -3,6 +3,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import SequenceViewer from './SequenceViewer';
 import type { SearchResponse, SpeciesResult } from '@/lib/pipeline';
+import type { PrimerPair } from '@/lib/primer';
 
 interface Tab {
   id: string;
@@ -92,11 +93,10 @@ export default function SearchWorkspace() {
     [activeId]
   );
 
-  const exportAll = useCallback(() => {
-    if (!tabs.length) return;
-    const payload = encodeURIComponent(
+  const buildPayload = (subset: Tab[]) =>
+    encodeURIComponent(
       JSON.stringify(
-        tabs.map((t) => ({
+        subset.map((t) => ({
           id: t.id,
           gene: t.gene,
           motif: t.motif,
@@ -106,8 +106,40 @@ export default function SearchWorkspace() {
         }))
       )
     );
-    window.open(`/print?data=${payload}`, '_blank', 'noopener');
-  }, [tabs]);
+
+  const openPrint = useCallback((subset: Tab[]) => {
+    if (!subset.length) return;
+    // Use sessionStorage to avoid URL length issues with large payloads
+    // (10 kb windows × multiple species × multiple tabs would blow past
+    // typical URL limits). Pass a short token via the URL and stash the
+    // payload in sessionStorage on the same origin.
+    const token = `gm-print-${Date.now().toString(36)}`;
+    try {
+      const json = JSON.stringify(
+        subset.map((t) => ({
+          id: t.id,
+          gene: t.gene,
+          motif: t.motif,
+          flankBefore: t.flankBefore,
+          flankAfter: t.flankAfter,
+          results: t.results,
+        }))
+      );
+      sessionStorage.setItem(token, json);
+    } catch {
+      // sessionStorage may be disabled (private browsing). Fall back to URL.
+      const fallback = buildPayload(subset);
+      window.open(`/print?data=${fallback}`, '_blank', 'noopener');
+      return;
+    }
+    window.open(`/print?token=${token}`, '_blank', 'noopener');
+  }, []);
+
+  const exportAll = useCallback(() => openPrint(tabs), [tabs, openPrint]);
+  const exportCurrent = useCallback(() => {
+    if (!activeTab) return;
+    openPrint([activeTab]);
+  }, [activeTab, openPrint]);
 
   return (
     <>
@@ -149,15 +181,27 @@ export default function SearchWorkspace() {
         <button className="btn" onClick={onSearch} disabled={busy}>
           {busy ? 'Searching…' : 'Search + new tab'}
         </button>
-        <button
-          className="btn secondary"
-          onClick={exportAll}
-          disabled={!tabs.length}
-          title="Open the print view in a new tab and use the browser's Save as PDF in landscape orientation."
-        >
-          Export PDF
-        </button>
+        <div className="export-group">
+          <button
+            className="btn secondary"
+            onClick={exportCurrent}
+            disabled={!activeTab}
+            title="Print only the active tab. Opens a landscape print view; use the browser's Save as PDF."
+          >
+            Export current tab
+          </button>
+          <button
+            className="btn secondary"
+            onClick={exportAll}
+            disabled={!tabs.length}
+            title="Print all open tabs as columns. Opens a landscape print view; use the browser's Save as PDF."
+          >
+            Export all tabs
+          </button>
+        </div>
       </div>
+
+      <MotifHelp />
 
       {error ? <div className="banner warn" style={{ marginTop: 12 }}>{error}</div> : null}
 
@@ -235,6 +279,23 @@ export default function SearchWorkspace() {
   );
 }
 
+function MotifHelp() {
+  return (
+    <div className="motif-help">
+      <strong>What is a motif?</strong> A motif is the DNA pattern (binding
+      site / domain) you are searching for in the promoter window — for
+      example <code>TTCnnnGAA</code>, where <code>n</code> is any base.
+      Each row in the results below is a single match of that pattern in
+      the promoter sequence. Lower-case <code>n</code> and the IUPAC codes
+      (R, Y, W, S, K, M, B, D, H, V, N) are all supported. For every match
+      we also propose 1–3 candidate primer pairs sized for ChIP-qPCR by
+      SYBR Green (amplicon 100–250 bp, primer 18–24 nt, Tm ≈ 60 °C, GC
+      40–60%). These are heuristic candidates — validate with Primer-BLAST
+      and a wet-lab gradient before ordering.
+    </div>
+  );
+}
+
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="field">
@@ -280,12 +341,58 @@ function MatchesView({ results }: { results: SpeciesResult[] }) {
                   <mark>{m.matched}</mark>
                   {m.contextAfter}
                 </div>
+                <PrimerList primers={m.primers || []} />
               </div>
             ))
           )}
         </section>
       ))}
     </>
+  );
+}
+
+function PrimerList({ primers }: { primers: PrimerPair[] }) {
+  if (!primers.length) {
+    return (
+      <div className="primer-empty">
+        No SYBR-friendly primer pairs in 100–250 bp window around this match.
+      </div>
+    );
+  }
+  return (
+    <div className="primer-block">
+      <div className="primer-title">
+        ChIP-qPCR primer candidates (SYBR Green) — heuristic; validate with Primer-BLAST
+      </div>
+      <table className="primer-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Forward (5'→3')</th>
+            <th>Reverse (5'→3', RC)</th>
+            <th>Amplicon</th>
+            <th>Tm F / R</th>
+            <th>GC F / R</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          {primers.map((p, i) => (
+            <tr key={i}>
+              <td>{i + 1}</td>
+              <td><code>{p.forward.sequence}</code></td>
+              <td><code>{p.reverse.sequence}</code></td>
+              <td>{p.ampliconSize} bp</td>
+              <td>{p.forward.tm.toFixed(1)} / {p.reverse.tm.toFixed(1)} °C</td>
+              <td>{(p.forward.gc * 100).toFixed(0)}% / {(p.reverse.gc * 100).toFixed(0)}%</td>
+              <td className="primer-warn">
+                {[...p.warnings, ...p.forward.warnings.map((w) => `F: ${w}`), ...p.reverse.warnings.map((w) => `R: ${w}`)].join('; ') || '—'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
