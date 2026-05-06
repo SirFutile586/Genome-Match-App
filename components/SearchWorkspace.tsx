@@ -2,8 +2,11 @@
 
 import { useCallback, useMemo, useState } from 'react';
 import SequenceViewer from './SequenceViewer';
-import type { SearchResponse, SpeciesResult } from '@/lib/pipeline';
+import type { PanelSearchResponse, SearchResponse, SpeciesResult } from '@/lib/pipeline';
+import type { MotifMatch } from '@/lib/sequence';
 import type { PrimerPair } from '@/lib/primer';
+import { buildTargetWindow } from '@/lib/sequence';
+import { buildTargetFasta, formatRelPosition, bucketRelPosition, buildPrimer3Target } from '@/lib/format';
 
 interface Tab {
   id: string;
@@ -12,6 +15,8 @@ interface Tab {
   motif: string;
   flankBefore: number;
   flankAfter: number;
+  ampliconMin: number;
+  ampliconMax: number;
   results: SpeciesResult[];
   warnings: string[];
 }
@@ -19,12 +24,62 @@ interface Tab {
 type ViewMode = 'matches' | 'viewer';
 
 const FLANK_MAX = 110;
+const AMPLICON_MIN_LIMIT = 50;
+const AMPLICON_MAX_LIMIT = 1000;
+
+/**
+ * Centered target-window presets (left flank + match + right flank). The
+ * advisor described two common choices: 200 bp total centered on the motif
+ * (≈100 bp each side) and 200 bp on each side (≈400 bp total). We expose
+ * both, plus a tighter 50-bp-each-side option and a fully custom mode.
+ */
+interface FlankPreset {
+  id: string;
+  label: string;
+  left: number;
+  right: number;
+  /** Brief hint shown under the preset selector. */
+  hint: string;
+}
+const FLANK_PRESETS: FlankPreset[] = [
+  {
+    id: '100-100',
+    label: '~200 bp total · 100 bp each side',
+    left: 100,
+    right: 100,
+    hint: 'Total ≈200 bp centered on the motif. Default for most ChIP-qPCR primer design.',
+  },
+  {
+    id: '50-50',
+    label: '~100 bp total · 50 bp each side',
+    left: 50,
+    right: 50,
+    hint: 'Tight 50 bp on each side of the motif when you want a short context window.',
+  },
+  {
+    id: '200-200',
+    label: '~400 bp total · 200 bp each side',
+    left: 200,
+    right: 200,
+    hint: '200 bp on each side of the motif — extra room for the primer designer to roam.',
+  },
+  {
+    id: 'custom',
+    label: 'Custom left / right (bp)',
+    left: 100,
+    right: 100,
+    hint: 'Set the left and right flank explicitly.',
+  },
+];
 
 export default function SearchWorkspace() {
   const [gene, setGene] = useState('ST3GAL1');
+  const [genesPanel, setGenesPanel] = useState('');
   const [motif, setMotif] = useState('TTCnnnGAA');
   const [flankBefore, setFlankBefore] = useState(50);
   const [flankAfter, setFlankAfter] = useState(50);
+  const [ampliconMin, setAmpliconMin] = useState(100);
+  const [ampliconMax, setAmpliconMax] = useState(250);
 
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -45,10 +100,31 @@ export default function SearchWorkspace() {
     [tabs, activeId]
   );
 
+  const tabFromSearch = useCallback((data: SearchResponse): Tab => {
+    const id = `${data.gene}-${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 6)}`;
+    return {
+      id,
+      label: `${data.gene} · ${data.motif}`,
+      gene: data.gene,
+      motif: data.motif,
+      flankBefore: data.flankBefore,
+      flankAfter: data.flankAfter,
+      ampliconMin: data.ampliconMin,
+      ampliconMax: data.ampliconMax,
+      results: data.results,
+      warnings: data.warnings,
+    };
+  }, []);
+
   const onSearch = useCallback(async () => {
     setError(null);
     if (!gene.trim()) return setError('Enter a gene symbol.');
     if (!motif.trim()) return setError('Enter a motif (IUPAC codes allowed).');
+    if (ampliconMax <= ampliconMin) {
+      return setError('Amplicon max must be greater than amplicon min.');
+    }
     setBusy(true);
     try {
       const res = await fetch('/api/search', {
@@ -59,6 +135,8 @@ export default function SearchWorkspace() {
           motif,
           flankBefore,
           flankAfter,
+          ampliconMin,
+          ampliconMax,
           species: ['human', 'mouse'],
         }),
       });
@@ -67,26 +145,55 @@ export default function SearchWorkspace() {
         throw new Error(body?.error || `Search failed (${res.status}).`);
       }
       const data: SearchResponse = await res.json();
-      const id = `${data.gene}-${Date.now().toString(36)}`;
-      const tab: Tab = {
-        id,
-        label: `${data.gene} · ${data.motif}`,
-        gene: data.gene,
-        motif: data.motif,
-        flankBefore: data.flankBefore,
-        flankAfter: data.flankAfter,
-        results: data.results,
-        warnings: data.warnings,
-      };
+      const tab = tabFromSearch(data);
       setTabs((prev) => [...prev, tab]);
-      setActiveId(id);
+      setActiveId(tab.id);
       setView('matches');
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setBusy(false);
     }
-  }, [gene, motif, flankBefore, flankAfter]);
+  }, [gene, motif, flankBefore, flankAfter, ampliconMin, ampliconMax, tabFromSearch]);
+
+  const onPanelSearch = useCallback(async () => {
+    setError(null);
+    const genes = parseGeneList(genesPanel);
+    if (!genes.length) return setError('Enter at least one gene symbol in the panel input.');
+    if (!motif.trim()) return setError('Enter a motif (IUPAC codes allowed).');
+    if (ampliconMax <= ampliconMin) {
+      return setError('Amplicon max must be greater than amplicon min.');
+    }
+    setBusy(true);
+    try {
+      const res = await fetch('/api/search', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          genes,
+          motif,
+          flankBefore,
+          flankAfter,
+          ampliconMin,
+          ampliconMax,
+          species: ['human', 'mouse'],
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.error || `Panel search failed (${res.status}).`);
+      }
+      const panel: PanelSearchResponse = await res.json();
+      const newTabs = panel.searches.map((s) => tabFromSearch(s));
+      setTabs((prev) => [...prev, ...newTabs]);
+      if (newTabs.length) setActiveId(newTabs[newTabs.length - 1].id);
+      setView('matches');
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }, [genesPanel, motif, flankBefore, flankAfter, ampliconMin, ampliconMax, tabFromSearch]);
 
   const closeTab = useCallback(
     (id: string) => {
@@ -109,6 +216,8 @@ export default function SearchWorkspace() {
         motif: t.motif,
         flankBefore: t.flankBefore,
         flankAfter: t.flankAfter,
+        ampliconMin: t.ampliconMin,
+        ampliconMax: t.ampliconMax,
         results: t.results,
       }))
     );
@@ -126,14 +235,8 @@ export default function SearchWorkspace() {
       .slice(2, 8)}`;
     const json = serializeTabs(subset);
 
-    // Persist to BOTH localStorage (shared across tabs on the same origin —
-    // works even when window.open is called with noopener which gives the
-    // popup a fresh sessionStorage) and sessionStorage (some hardened
-    // browsers proxy localStorage but allow sessionStorage). Clean up old
-    // entries so we don't leak large payloads.
     let stored = false;
     try {
-      // Best-effort cleanup of stale tokens (>30 min old).
       const cutoff = Date.now() - 30 * 60 * 1000;
       for (let i = localStorage.length - 1; i >= 0; i--) {
         const key = localStorage.key(i);
@@ -155,9 +258,6 @@ export default function SearchWorkspace() {
     }
 
     const printUrl = `/print?token=${encodeURIComponent(token)}`;
-    // We intentionally do NOT pass 'noopener' — the print page calls
-    // window.print() and being able to access opener for a clean close is
-    // useful, plus omitting noopener helps with some popup blockers.
     let popup: Window | null = null;
     try {
       popup = window.open(printUrl, '_blank');
@@ -166,13 +266,8 @@ export default function SearchWorkspace() {
     }
 
     if (!popup || popup.closed || typeof popup.focus !== 'function') {
-      // Popup blocked. Surface a clickable fallback link the user can
-      // activate themselves (their click counts as a user gesture).
       setExportStatus({ kind: 'blocked', href: printUrl });
       if (!stored) {
-        // Even fallback won't have data — encode small payload in URL hash
-        // as last resort (fits ~2MB on modern browsers, but may still fail
-        // for very large multi-tab exports).
         try {
           const hashUrl = `/print#data=${encodeURIComponent(json)}`;
           setExportStatus({ kind: 'blocked', href: hashUrl });
@@ -204,20 +299,22 @@ export default function SearchWorkspace() {
   return (
     <>
       <div className="search-bar">
-        <Field label="Gene symbol">
+        <Field label="Gene symbol (single search)">
           <input
             value={gene}
             onChange={(e) => setGene(e.target.value)}
             placeholder="e.g. ST3GAL1"
             spellCheck={false}
+            data-testid="single-gene-input"
           />
         </Field>
-        <Field label="Motif (IUPAC)">
+        <Field label="Motif (IUPAC, applied to every search)">
           <input
             value={motif}
             onChange={(e) => setMotif(e.target.value)}
             placeholder="e.g. TTCnnnGAA"
             spellCheck={false}
+            data-testid="motif-input"
           />
         </Field>
         <Field label={`Context before (≤${FLANK_MAX} bp)`}>
@@ -238,7 +335,7 @@ export default function SearchWorkspace() {
             onChange={(e) => setFlankAfter(clamp(e.target.valueAsNumber, 0, FLANK_MAX))}
           />
         </Field>
-        <button className="btn" onClick={onSearch} disabled={busy}>
+        <button className="btn" onClick={onSearch} disabled={busy} data-testid="single-search-btn">
           {busy ? 'Searching…' : 'Search + new tab'}
         </button>
         <div className="export-group">
@@ -261,11 +358,75 @@ export default function SearchWorkspace() {
         </div>
       </div>
 
+      <div className="advanced-bar">
+        <Field label="Amplicon min (bp)">
+          <input
+            type="number"
+            min={AMPLICON_MIN_LIMIT}
+            max={AMPLICON_MAX_LIMIT}
+            value={ampliconMin}
+            onChange={(e) =>
+              setAmpliconMin(clamp(e.target.valueAsNumber, AMPLICON_MIN_LIMIT, AMPLICON_MAX_LIMIT))
+            }
+            data-testid="amplicon-min-input"
+          />
+        </Field>
+        <Field label="Amplicon max (bp)">
+          <input
+            type="number"
+            min={AMPLICON_MIN_LIMIT}
+            max={AMPLICON_MAX_LIMIT}
+            value={ampliconMax}
+            onChange={(e) =>
+              setAmpliconMax(clamp(e.target.valueAsNumber, AMPLICON_MIN_LIMIT, AMPLICON_MAX_LIMIT))
+            }
+            data-testid="amplicon-max-input"
+          />
+        </Field>
+        <div className="advanced-help">
+          <strong>Built-in primer candidates</strong> respect this amplicon range
+          (default 100–250 bp for ChIP-qPCR / SYBR Green). Increase the upper
+          bound for traditional qPCR fragments or longer ChIP amplicons. Primer
+          length 18–24 nt and Tm ≈60 °C remain fixed; export the centered
+          target sequence below to design primers in Primer3Plus or
+          Primer-BLAST when the built-in heuristic returns &lt;3 candidates.
+        </div>
+      </div>
+
+      <div className="panel-bar">
+        <Field label="Multi-gene panel (one per line or comma-separated)">
+          <textarea
+            value={genesPanel}
+            onChange={(e) => setGenesPanel(e.target.value)}
+            placeholder={'e.g.\nSTAT3\nIRF1\nST3GAL1\nMYC'}
+            rows={3}
+            spellCheck={false}
+            data-testid="panel-input"
+          />
+        </Field>
+        <button
+          className="btn"
+          onClick={onPanelSearch}
+          disabled={busy}
+          data-testid="panel-search-btn"
+        >
+          {busy ? 'Searching panel…' : 'Run panel (one tab per gene)'}
+        </button>
+        <div className="panel-help">
+          Runs the same motif search across every gene for human and mouse,
+          opens one tab per gene, and produces a comparison summary at the
+          top of the results showing per-gene binding-site counts and the
+          general −bp position of the closest hit.
+        </div>
+      </div>
+
       <MotifHelp />
 
       {error ? <div className="banner warn" style={{ marginTop: 12 }}>{error}</div> : null}
 
       <ExportStatusBanner status={exportStatus} onDismiss={dismissExportStatus} />
+
+      <ComparisonPanel tabs={tabs} setActiveId={setActiveId} />
 
       <div className="tabs" role="tablist">
         {tabs.map((t) => (
@@ -300,7 +461,7 @@ export default function SearchWorkspace() {
                 className={`subtab ${view === 'matches' ? 'active' : ''}`}
                 onClick={() => setView('matches')}
               >
-                Quick matches
+                Matches &amp; primer design
               </button>
               <button
                 className={`subtab ${view === 'viewer' ? 'active' : ''}`}
@@ -310,8 +471,9 @@ export default function SearchWorkspace() {
               </button>
             </div>
             <div className="sub" style={{ color: 'var(--ink-3)', fontSize: 12 }}>
-              Motif <strong style={{ color: 'var(--ink)' }}>{activeTab.motif}</strong> · context{' '}
-              {activeTab.flankBefore}/{activeTab.flankAfter} bp
+              Motif <strong style={{ color: 'var(--ink)' }}>{activeTab.motif}</strong> ·
+              context {activeTab.flankBefore}/{activeTab.flankAfter} bp · amplicon{' '}
+              {activeTab.ampliconMin}–{activeTab.ampliconMax} bp
             </div>
           </div>
 
@@ -320,7 +482,7 @@ export default function SearchWorkspace() {
           ) : null}
 
           {view === 'matches' ? (
-            <MatchesView results={activeTab.results} />
+            <MatchesView tab={activeTab} />
           ) : (
             <ViewerView results={activeTab.results} motif={activeTab.motif} />
           )}
@@ -330,7 +492,11 @@ export default function SearchWorkspace() {
       ) : (
         <div className="empty-state" style={{ marginTop: 20 }}>
           <h2>No searches yet</h2>
-          <p>Try gene <code>ST3GAL1</code> with motif <code>TTCnnnGAA</code> and 50 bp context. Each search opens a new tab.</p>
+          <p>
+            Try gene <code>ST3GAL1</code> with motif <code>TTCnnnGAA</code> and the default amplicon
+            range. Each search opens a new tab; the panel input above runs the same motif across
+            many genes at once for cross-gene comparison.
+          </p>
           <p style={{ color: 'var(--ink-3)', fontSize: 12, marginTop: 8 }}>
             Sequences are fetched live from NCBI Datasets + EFetch on every search; the first
             request for a gene can take a few seconds.
@@ -341,9 +507,23 @@ export default function SearchWorkspace() {
   );
 }
 
-interface ExportStatus {
-  kind: 'idle' | 'starting' | 'opened' | 'blocked' | 'empty' | 'error';
+function parseGeneList(input: string): string[] {
+  if (!input) return [];
+  const parts = input
+    .split(/[\s,;]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of parts) {
+    const key = p.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(p);
+  }
+  return out;
 }
+
 function ExportStatusBanner({
   status,
   onDismiss,
@@ -421,13 +601,21 @@ function MotifHelp() {
       <strong>What is a motif?</strong> A motif is the DNA pattern (binding
       site / domain) you are searching for in the promoter window — for
       example <code>TTCnnnGAA</code>, where <code>n</code> is any base.
-      Each row in the results below is a single match of that pattern in
-      the promoter sequence. Lower-case <code>n</code> and the IUPAC codes
-      (R, Y, W, S, K, M, B, D, H, V, N) are all supported. For every match
-      we also propose 1–3 candidate primer pairs sized for ChIP-qPCR by
-      SYBR Green (amplicon 100–250 bp, primer 18–24 nt, Tm ≈ 60 °C, GC
-      40–60%). These are heuristic candidates — validate with Primer-BLAST
-      and a wet-lab gradient before ordering.
+      Each match is a single binding-site candidate; the app numbers matches
+      per gene/species and reports the relative position from the TSS in
+      advisor-friendly notation (e.g. <code>−1234 bp from TSS</code>) plus
+      the exact genomic interval. <strong>Built-in primer candidates are
+      preliminary heuristics</strong> — always validate with{' '}
+      <a href="https://www.ncbi.nlm.nih.gov/tools/primer-blast/" target="_blank" rel="noopener noreferrer">
+        Primer-BLAST
+      </a>{' '}
+      and{' '}
+      <a href="https://www.primer3plus.com/" target="_blank" rel="noopener noreferrer">
+        Primer3Plus
+      </a>
+      , then a wet-lab gradient before ordering. Use the per-match
+      <strong> Target sequence (for online primer design)</strong> block to
+      copy a centered FASTA to feed the online tools.
     </div>
   );
 }
@@ -446,40 +634,116 @@ function clamp(n: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, Math.floor(n)));
 }
 
-function MatchesView({ results }: { results: SpeciesResult[] }) {
+function ComparisonPanel({
+  tabs,
+  setActiveId,
+}: {
+  tabs: Tab[];
+  setActiveId: (id: string) => void;
+}) {
+  if (tabs.length < 2) return null;
+  // The advisor wanted to see at-a-glance which genes have the motif and
+  // which don't. We render a per-gene/species table summarizing match count,
+  // the closest position to TSS, and a general -bp bucket.
+  return (
+    <div className="comparison" data-testid="comparison-panel">
+      <div className="comparison-title">
+        Cross-gene comparison ({tabs.length} tab{tabs.length === 1 ? '' : 's'})
+      </div>
+      <div className="comparison-help">
+        Quick view of binding-site counts per gene/species at the current
+        motif. <em>Closest</em> reports the smallest <code>|bp|</code> from
+        TSS; <em>General</em> rounds it for cross-gene comparison.
+      </div>
+      <div className="comparison-table-wrap">
+        <table className="comparison-table">
+          <thead>
+            <tr>
+              <th>Gene</th>
+              <th>Motif</th>
+              <th>Species</th>
+              <th>Hits</th>
+              <th>Closest to TSS</th>
+              <th>General position</th>
+              <th>Source</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {tabs.flatMap((t) =>
+              t.results.map((r) => {
+                const closest = r.matches.length
+                  ? r.matches.reduce((best, m) =>
+                      Math.abs(m.relPositionFromTSS) < Math.abs(best.relPositionFromTSS) ? m : best
+                    )
+                  : null;
+                return (
+                  <tr key={`${t.id}-${r.species}`}>
+                    <td>{t.gene}</td>
+                    <td><code>{t.motif}</code></td>
+                    <td>{r.taxon}</td>
+                    <td className={r.error ? 'cell-warn' : r.matches.length === 0 ? 'cell-zero' : ''}>
+                      {r.error ? '—' : r.matches.length}
+                      {!r.error && r.matches.length === 0 ? ' (none)' : ''}
+                    </td>
+                    <td>{closest ? formatRelPosition(closest.relPositionFromTSS) : '—'}</td>
+                    <td>{closest ? bucketRelPosition(closest.relPositionFromTSS) : '—'}</td>
+                    <td>
+                      {r.error
+                        ? <span className="cell-warn">{r.error.slice(0, 40)}…</span>
+                        : r.meta
+                          ? `${r.meta.assembly} · ${r.meta.transcriptAccession}`
+                          : '—'}
+                    </td>
+                    <td>
+                      <button className="btn ghost btn-sm" onClick={() => setActiveId(t.id)}>
+                        open
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function MatchesView({ tab }: { tab: Tab }) {
   return (
     <>
-      {results.map((r) => (
+      {tab.results.map((r) => (
         <section key={r.species} className="species-block">
           <h2>
             {r.taxon}
             <span className="count">
               {r.error
                 ? 'lookup failed'
-                : `${r.matches.length} match${r.matches.length === 1 ? '' : 'es'}`}
-              {r.meta ? ` · ${r.meta.assembly}` : ''}
+                : `${r.matches.length} binding site${r.matches.length === 1 ? '' : 's'}`}
+              {r.meta ? ` · ${r.meta.assembly} · ${r.meta.transcriptAccession}` : ''}
             </span>
           </h2>
           {r.error ? (
             <div className="empty-state">{r.error}</div>
           ) : r.matches.length === 0 ? (
             <div className="empty-state">
-              No matches in the {r.windowEnd.toLocaleString()} bp upstream window.
+              No binding sites in the {r.windowEnd.toLocaleString()} bp upstream window for motif{' '}
+              <code>{tab.motif}</code>.
             </div>
           ) : (
-            r.matches.map((m, i) => (
-              <div key={i} className="match-card">
-                <div className="meta">
-                  pos {m.position}–{m.end} ({m.position + 1}–{m.end} bp upstream of TSS) · {r.taxon}
-                </div>
-                <div className="seq">
-                  {m.contextBefore}
-                  <mark>{m.matched}</mark>
-                  {m.contextAfter}
-                </div>
-                <PrimerList primers={m.primers || []} />
-              </div>
-            ))
+            <>
+              <BindingSiteIndex matches={r.matches} taxon={r.taxon} />
+              {r.matches.map((m) => (
+                <MatchCard
+                  key={m.index}
+                  tab={tab}
+                  result={r}
+                  match={m}
+                />
+              ))}
+            </>
           )}
         </section>
       ))}
@@ -487,18 +751,98 @@ function MatchesView({ results }: { results: SpeciesResult[] }) {
   );
 }
 
-function PrimerList({ primers }: { primers: PrimerPair[] }) {
+function BindingSiteIndex({ matches, taxon }: { matches: MotifMatch[]; taxon: string }) {
+  return (
+    <div className="binding-index" data-testid="binding-index">
+      <div className="binding-index-title">
+        Binding-site locations · {taxon} · {matches.length} site{matches.length === 1 ? '' : 's'}
+      </div>
+      <ol className="binding-index-list">
+        {matches.map((m) => (
+          <li key={m.index}>
+            <strong>#{m.index}</strong> · {formatRelPosition(m.relPositionFromTSS)} from TSS{' '}
+            <span className="muted">
+              (general position {bucketRelPosition(m.relPositionFromTSS)})
+            </span>
+            {m.genomicStart != null && m.genomicEnd != null ? (
+              <span className="muted">
+                {' '}
+                · genomic {m.genomicStart.toLocaleString()}–{m.genomicEnd.toLocaleString()} (
+                {m.genomicStrand})
+              </span>
+            ) : null}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function MatchCard({
+  tab,
+  result,
+  match,
+}: {
+  tab: Tab;
+  result: SpeciesResult;
+  match: MotifMatch;
+}) {
+  return (
+    <div className="match-card" data-testid="match-card">
+      <div className="meta">
+        <strong>Binding site #{match.index}</strong> · {formatRelPosition(match.relPositionFromTSS)}{' '}
+        from TSS · {result.taxon}
+        {result.meta ? (
+          <>
+            {' '}
+            · transcript <code>{result.meta.transcriptAccession}</code>
+            {match.genomicStart != null && match.genomicEnd != null ? (
+              <>
+                {' '}
+                · genomic <code>{result.meta.chromosomeAccession}:
+                {match.genomicStart.toLocaleString()}–{match.genomicEnd.toLocaleString()}</code> (
+                {match.genomicStrand} strand)
+              </>
+            ) : null}
+          </>
+        ) : null}
+      </div>
+      <div className="seq">
+        {match.contextBefore}
+        <mark>{match.matched}</mark>
+        {match.contextAfter}
+      </div>
+      <PrimerList primers={match.primers || []} ampliconMin={tab.ampliconMin} ampliconMax={tab.ampliconMax} />
+      <TargetSequenceBlock tab={tab} result={result} match={match} />
+    </div>
+  );
+}
+
+function PrimerList({
+  primers,
+  ampliconMin,
+  ampliconMax,
+}: {
+  primers: PrimerPair[];
+  ampliconMin: number;
+  ampliconMax: number;
+}) {
   if (!primers.length) {
     return (
       <div className="primer-empty">
-        No SYBR-friendly primer pairs in 100–250 bp window around this match.
+        No SYBR-friendly primer pairs in {ampliconMin}–{ampliconMax} bp window around this site.
+        Use the target sequence below to design primers in Primer3Plus / Primer-BLAST.
       </div>
     );
   }
+  const partial = primers.length < 3;
   return (
     <div className="primer-block">
       <div className="primer-title">
-        ChIP-qPCR primer candidates (SYBR Green) — heuristic; validate with Primer-BLAST
+        Preliminary primer candidates ({primers.length}/3) · ChIP-qPCR · SYBR Green ·{' '}
+        <span className="muted">
+          heuristic — validate with Primer-BLAST + Primer3Plus + wet lab
+        </span>
       </div>
       <table className="primer-table">
         <thead>
@@ -528,7 +872,194 @@ function PrimerList({ primers }: { primers: PrimerPair[] }) {
           ))}
         </tbody>
       </table>
+      {partial ? (
+        <div className="primer-partial">
+          Only {primers.length} pair{primers.length === 1 ? '' : 's'} passed the SYBR filters in
+          your amplicon window. Loosen the amplicon range or design manually with the target
+          sequence below.
+        </div>
+      ) : null}
     </div>
+  );
+}
+
+function TargetSequenceBlock({
+  tab,
+  result,
+  match,
+}: {
+  tab: Tab;
+  result: SpeciesResult;
+  match: MotifMatch;
+}) {
+  const [presetId, setPresetId] = useState('100-100');
+  const [customLeft, setCustomLeft] = useState(100);
+  const [customRight, setCustomRight] = useState(100);
+  const preset = FLANK_PRESETS.find((p) => p.id === presetId) || FLANK_PRESETS[0];
+  const left = presetId === 'custom' ? customLeft : preset.left;
+  const right = presetId === 'custom' ? customRight : preset.right;
+
+  const window = useMemo(
+    () => buildTargetWindow(result.promoterWindow, match.position, match.end, left, right),
+    [result.promoterWindow, match.position, match.end, left, right]
+  );
+
+  const fasta = useMemo(
+    () =>
+      result.meta
+        ? buildTargetFasta({
+            gene: tab.gene,
+            taxon: result.taxon,
+            motifLabel: tab.motif,
+            motifIndex: match.index,
+            match,
+            meta: result.meta,
+            sequence: window.sequence,
+            leftFlank: window.leftFlank,
+            rightFlank: window.rightFlank,
+            motifOffset: window.motifOffset,
+            motifLength: window.motifLength,
+          })
+        : '',
+    [tab.gene, tab.motif, result.taxon, result.meta, match, window]
+  );
+
+  const primer3Hint = buildPrimer3Target(window.motifOffset, window.motifLength);
+
+  return (
+    <details className="target-block" data-testid="target-block">
+      <summary>
+        Target sequence (for online primer design) — {window.leftFlank} bp left + {window.motifLength} bp
+        motif + {window.rightFlank} bp right ={' '}
+        <strong>{window.sequence.length} bp total</strong>
+      </summary>
+      <div className="target-controls">
+        <Field label="Centered window preset">
+          <select
+            value={presetId}
+            onChange={(e) => setPresetId(e.target.value)}
+            data-testid="target-preset-select"
+          >
+            {FLANK_PRESETS.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+        </Field>
+        {presetId === 'custom' ? (
+          <>
+            <Field label="Left flank (bp before motif)">
+              <input
+                type="number"
+                min={0}
+                max={5000}
+                value={customLeft}
+                onChange={(e) => setCustomLeft(clamp(e.target.valueAsNumber, 0, 5000))}
+              />
+            </Field>
+            <Field label="Right flank (bp after motif)">
+              <input
+                type="number"
+                min={0}
+                max={5000}
+                value={customRight}
+                onChange={(e) => setCustomRight(clamp(e.target.valueAsNumber, 0, 5000))}
+              />
+            </Field>
+          </>
+        ) : null}
+        <div className="target-hint">{preset.hint}</div>
+      </div>
+
+      <div className="target-grid">
+        <div className="target-col">
+          <div className="target-label">FASTA (paste into Primer-BLAST / Primer3Plus)</div>
+          <textarea
+            readOnly
+            className="target-fasta"
+            value={fasta || window.sequence}
+            data-testid="target-fasta"
+          />
+          <div className="target-actions">
+            <CopyButton text={fasta || window.sequence} label="Copy FASTA" testid="copy-fasta" />
+            <CopyButton
+              text={window.sequence}
+              label="Copy plain sequence"
+              testid="copy-plain"
+            />
+            <CopyButton
+              text={primer3Hint}
+              label="Copy Primer3 SEQUENCE_TARGET"
+              testid="copy-target-hint"
+            />
+          </div>
+          <div className="target-meta">
+            Motif <code>{match.matched}</code> sits at offset{' '}
+            <strong>
+              {window.motifOffset}–{window.motifOffset + window.motifLength}
+            </strong>{' '}
+            inside the target window. Primer3 hint:{' '}
+            <code>{primer3Hint}</code>
+          </div>
+          <div className="target-links">
+            <a
+              href="https://www.ncbi.nlm.nih.gov/tools/primer-blast/"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Primer-BLAST ↗
+            </a>{' '}
+            ·{' '}
+            <a
+              href="https://www.primer3plus.com/"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Primer3Plus ↗
+            </a>{' '}
+            · Always BLAST your final pair for genome-wide specificity.
+          </div>
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function CopyButton({ text, label, testid }: { text: string; label: string; testid?: string }) {
+  const [state, setState] = useState<'idle' | 'ok' | 'err'>('idle');
+  const onClick = useCallback(async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // Legacy fallback: programmatic textarea + execCommand.
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+      }
+      setState('ok');
+      setTimeout(() => setState('idle'), 1400);
+    } catch {
+      setState('err');
+      setTimeout(() => setState('idle'), 1800);
+    }
+  }, [text]);
+  return (
+    <button
+      className="btn secondary btn-sm"
+      onClick={onClick}
+      data-testid={testid}
+      aria-label={label}
+    >
+      {state === 'ok' ? 'Copied!' : state === 'err' ? 'Copy failed' : label}
+    </button>
   );
 }
 
@@ -575,7 +1106,7 @@ function SourceMetadata({ results }: { results: SpeciesResult[] }) {
   if (!anyMeta) return null;
   return (
     <div className="notes">
-      <div style={{ fontWeight: 600, marginBottom: 4 }}>Sequence provenance</div>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>Sequence provenance &amp; coordinate system</div>
       <ul>
         {results.map((r) =>
           r.meta ? (
@@ -600,10 +1131,12 @@ function SourceMetadata({ results }: { results: SpeciesResult[] }) {
         )}
       </ul>
       <div style={{ color: 'var(--ink-3)', fontSize: 11, marginTop: 6 }}>
-        Position 0 bp anchors the canonical RefSeq transcript&apos;s TSS; index increases moving
-        upstream. The displayed sequence is the transcript-strand 10 kb upstream window (reverse
-        complemented for minus-strand genes by NCBI EFetch). Always verify the chosen transcript is
-        appropriate for your biological question — alternative TSSs may exist.
+        <strong>Zero reference:</strong> 0 bp = TSS (transcript 5' end of the canonical RefSeq /
+        MANE Select transcript shown above). Negative numbers (e.g. −1234 bp) are upstream of the
+        TSS. Genomic coordinates are 1-based on the chromosome accession; for minus-strand genes
+        the displayed promoter is reverse-complemented by NCBI EFetch so the same negative-bp
+        notation works in both orientations. Always verify the chosen transcript is appropriate
+        for your biological question — alternative TSSs may exist.
       </div>
     </div>
   );

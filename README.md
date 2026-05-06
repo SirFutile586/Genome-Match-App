@@ -54,6 +54,67 @@ the 10 kb upstream window from the pinned reference assembly.
   chromosome accession, transcript accession + select category (or
   fallback reason), strand, TSS, fetched-at timestamp, and genomic
   interval.
+- **Multi-gene panel mode.** Paste a list of gene symbols (one per
+  line or comma-separated) and the app fans out the same motif search
+  across every gene for both species, opens one tab per gene, and
+  builds a cross-gene comparison table summarizing binding-site counts
+  and the closest TSS-relative position for each gene/species. Useful
+  for asking "which of these candidates actually have a STAT3 motif
+  near the promoter?".
+- **Binding-site index per gene/species.** For every match the app
+  reports its 1-based binding-site number, advisor-friendly relative
+  position from the TSS (e.g. `−1234 bp from TSS`), a "general
+  position" bucket (e.g. `~−1000 bp`), and the **exact 1-based
+  genomic interval** of the motif on the chromosome accession (with
+  strand). 0 bp = canonical transcript TSS; the transcript accession
+  and select category are surfaced under the table.
+- **Online-primer-design target sequence.** Each match has an
+  expandable "Target sequence" block that builds a centered FASTA
+  package suitable for pasting into Primer-BLAST or Primer3Plus.
+  Three centered presets are exposed (50 bp each side ≈ 100 bp total,
+  100 bp each side ≈ 200 bp total, 200 bp each side ≈ 400 bp total)
+  plus a fully custom left/right setting. Header packs gene, species,
+  motif, binding-site index, relative position, exact genomic
+  interval, transcript accession, assembly, strand, and motif offset
+  inside the target window. Copy buttons cover FASTA, plain sequence,
+  and a Primer3 `SEQUENCE_TARGET=offset,length` hint.
+- **Configurable amplicon range** for the built-in primer picker.
+  Default 100–250 bp (ChIP-qPCR / SYBR Green); user can widen or
+  narrow it. Built-in candidates respect the configured range; the
+  UI states clearly when fewer than three pairs pass the SYBR-friendly
+  filters.
+
+## ChIP-qPCR target-planning workflow
+
+The recommended flow when planning ChIP-qPCR primers across one or
+several genes:
+
+1. **Search the motif** for one gene (single-gene field) or for a
+   panel (paste gene symbols in the "Multi-gene panel" textarea).
+2. **Review the cross-gene comparison** at the top of the page to see
+   which genes have hits and roughly where (general −bp position).
+3. **Open a tab** and skim the binding-site index list for that gene
+   — it shows every site numbered, its relative position from the
+   TSS, and exact genomic coordinates.
+4. **Pick a binding site** to design primers around. ChIP-qPCR
+   convention is to take one fragment per region of interest and
+   design one or two primer pairs that flank the binding site.
+5. **Use the built-in candidates** for a starting point — they're
+   filtered to the configured amplicon window (default 100–250 bp)
+   and SYBR-friendly Tm/GC bands. They are explicitly labeled
+   *preliminary*.
+6. **Validate the design** by copying the per-match centered target
+   FASTA into Primer3Plus and Primer-BLAST. Use the offered presets
+   (50 / 100 / 200 bp each side) or a fully custom flank pair. The
+   FASTA header carries the genomic coordinates so Primer-BLAST can
+   check specificity against the right organism.
+7. **Run a wet-lab gradient + no-template control** before ordering.
+
+The app does **not** model cytokine-stimulation timepoints, signal
+transduction networks, or glycan-pattern prediction yet. Those
+features are intentionally out of scope at this stage; they will be
+layered on top of the same motif/target-sequence pipeline once the
+binding-site planning workflow is solid.
 
 ## How real-data lookup works
 
@@ -272,9 +333,26 @@ even look like here?" step, not to replace expert design review.
 - **NCBI throttling and outages.** Each search performs two NCBI
   requests per species. Without an API key you share a 3 rps IP-level
   pool with everyone else on the same egress; with a key you get ~10
-  rps. The app surfaces NCBI errors verbatim in the per-species
-  warning banner so you can distinguish "gene not found" from "NCBI
-  returned 502."
+  rps. Multi-gene panel mode caps server-side concurrency at 4
+  parallel gene lookups so a 20-gene panel fans out predictably; it
+  still benefits from `NCBI_API_KEY`. The app surfaces NCBI errors
+  verbatim in the per-species warning banner so you can distinguish
+  "gene not found" from "NCBI returned 502."
+- **Preliminary primer candidates.** The built-in primer picker is a
+  transparent heuristic — no Primer3 binary, no specificity check
+  against the genome. Treat the candidate list as a starting point
+  and always validate with Primer-BLAST + Primer3Plus + a wet-lab
+  gradient. The UI labels candidates as *preliminary*.
+- **Coordinate mapping for motif matches.** Genomic coordinates of a
+  motif occurrence are computed from the canonical transcript's TSS
+  and strand. They are exact to the bp on the displayed assembly but
+  inherit the canonical-transcript caveats above. Always cross-check
+  with the chosen transcript accession before publishing primer
+  designs.
+- **Out of scope for now.** Cytokine-timepoint kinetics, signal
+  transduction networks (JAK/STAT, MAPK, etc.), and glycan-pattern
+  prediction are explicitly not modeled in this version of the app
+  and should not be inferred from any output here.
 
 ## License
 

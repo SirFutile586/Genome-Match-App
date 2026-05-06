@@ -26,6 +26,8 @@
 import type { SpeciesResult } from './pipeline';
 import type { MotifMatch } from './sequence';
 import type { PrimerPair } from './primer';
+import { buildTargetWindow } from './sequence';
+import { buildTargetFasta, formatRelPosition, bucketRelPosition } from './format';
 
 export interface ExportTab {
   id: string;
@@ -33,8 +35,14 @@ export interface ExportTab {
   motif: string;
   flankBefore: number;
   flankAfter: number;
+  /** Optional — older payloads may omit these; we fall back to ChIP-qPCR defaults. */
+  ampliconMin?: number;
+  ampliconMax?: number;
   results: SpeciesResult[];
 }
+
+const EXPORT_TARGET_LEFT = 100;
+const EXPORT_TARGET_RIGHT = 100;
 
 const TABS_PER_PAGE = 4;
 const MATCHES_PER_PAGE_PER_COLUMN = 6; // approx; used to chunk content into pages so the column header re-prints
@@ -63,6 +71,8 @@ export function buildPrintHtml(tabs: ExportTab[]): string {
 </body>
 </html>`;
   }
+
+  const summarySection = tabs.length > 1 ? renderComparisonSummary(tabs) : '';
 
   // All-tabs export: paginate tabs in groups of up to TABS_PER_PAGE, each
   // group a landscape page that holds those tabs as side-by-side columns.
@@ -101,9 +111,54 @@ export function buildPrintHtml(tabs: ExportTab[]): string {
     <h1>Genome Match Report</h1>
     <div class="meta">${tabs.length} tab${tabs.length === 1 ? '' : 's'} · generated ${new Date().toISOString()}</div>
   </header>
+  ${summarySection}
   ${groups.join('\n')}
 </body>
 </html>`;
+}
+
+function renderComparisonSummary(tabs: ExportTab[]): string {
+  const rows: string[] = [];
+  for (const t of tabs) {
+    for (const r of t.results) {
+      const closest = r.matches.length
+        ? r.matches.reduce((best, m) =>
+            Math.abs(m.relPositionFromTSS) < Math.abs(best.relPositionFromTSS) ? m : best
+          )
+        : null;
+      rows.push(
+        `<tr>
+          <td>${escapeHtml(t.gene)}</td>
+          <td><code>${escapeHtml(t.motif)}</code></td>
+          <td>${escapeHtml(r.taxon)}</td>
+          <td class="${r.error ? 'cell-warn' : r.matches.length === 0 ? 'cell-zero' : ''}">${
+            r.error ? '—' : r.matches.length
+          }${!r.error && r.matches.length === 0 ? ' (none)' : ''}</td>
+          <td>${closest ? escapeHtml(formatRelPosition(closest.relPositionFromTSS)) : '—'}</td>
+          <td>${closest ? escapeHtml(bucketRelPosition(closest.relPositionFromTSS)) : '—'}</td>
+          <td>${
+            r.error
+              ? `<span class="cell-warn">${escapeHtml(r.error)}</span>`
+              : r.meta
+              ? `${escapeHtml(r.meta.assembly)} · ${escapeHtml(r.meta.transcriptAccession)}`
+              : '—'
+          }</td>
+        </tr>`
+      );
+    }
+  }
+  return `<section class="summary">
+    <h2>Cross-gene comparison</h2>
+    <table class="summary-table">
+      <thead>
+        <tr>
+          <th>Gene</th><th>Motif</th><th>Species</th><th>Hits</th>
+          <th>Closest to TSS</th><th>General position</th><th>Source</th>
+        </tr>
+      </thead>
+      <tbody>${rows.join('')}</tbody>
+    </table>
+  </section>`;
 }
 
 interface FlatMatch {
@@ -144,32 +199,103 @@ function renderColumn(tab: ExportTab, matches: FlatMatch[]): string {
     .map((r) =>
       r.error
         ? `${escapeHtml(r.taxon)}: lookup failed`
-        : `${escapeHtml(r.taxon)} ${r.matches.length}/${r.windowEnd.toLocaleString()}bp`
+        : `${escapeHtml(r.taxon)} ${r.matches.length} site${
+            r.matches.length === 1 ? '' : 's'
+          }/${r.windowEnd.toLocaleString()}bp`
     )
     .join(' · ');
+  const bindingIndex = renderBindingIndex(tab);
   return `<article class="col">
     <header class="col-header">
       <div class="col-title">${escapeHtml(tab.gene)}</div>
-      <div class="col-sub">motif <code>${escapeHtml(tab.motif)}</code></div>
+      <div class="col-sub">motif <code>${escapeHtml(tab.motif)}</code> · amplicon ${
+        tab.ampliconMin ?? 100
+      }–${tab.ampliconMax ?? 250} bp</div>
       <div class="col-sub muted">${speciesSummary}</div>
     </header>
     <div class="col-body">
-      ${matches.length ? matches.map((fm) => renderFlatMatch(fm, tab.motif)).join('') : `<div class="empty">No matches in 0–${(tab.results[0]?.windowEnd || 10000).toLocaleString()} bp window.</div>`}
+      ${bindingIndex}
+      ${matches.length ? matches.map((fm) => renderFlatMatch(fm, tab)).join('') : `<div class="empty">No matches in 0–${(tab.results[0]?.windowEnd || 10000).toLocaleString()} bp window.</div>`}
     </div>
   </article>`;
 }
 
-function renderFlatMatch(fm: FlatMatch, motif: string): string {
+function renderBindingIndex(tab: ExportTab): string {
+  const blocks = tab.results
+    .filter((r) => r.matches.length)
+    .map((r) => {
+      const list = r.matches
+        .map(
+          (m) =>
+            `<li>#${m.index} · ${escapeHtml(formatRelPosition(m.relPositionFromTSS))} (${escapeHtml(
+              bucketRelPosition(m.relPositionFromTSS)
+            )})${
+              m.genomicStart != null && m.genomicEnd != null
+                ? ` · ${m.genomicStart.toLocaleString()}–${m.genomicEnd.toLocaleString()} (${escapeHtml(
+                    m.genomicStrand || ''
+                  )})`
+                : ''
+            }</li>`
+        )
+        .join('');
+      return `<div class="binding-index">
+        <div class="binding-index-title">${escapeHtml(r.taxon)} · ${
+        r.matches.length
+      } binding site${r.matches.length === 1 ? '' : 's'}</div>
+        <ol>${list}</ol>
+      </div>`;
+    })
+    .join('');
+  return blocks;
+}
+
+function renderFlatMatch(fm: FlatMatch, tab: ExportTab): string {
   const r = fm.result;
   const m = fm.match;
-  const meta = r.meta
-    ? `${escapeHtml(r.meta.assembly)} · ${escapeHtml(r.meta.chromosomeAccession)}:${r.meta.upstreamGenomicStart}-${r.meta.upstreamGenomicEnd} · ${escapeHtml(r.meta.strand)}`
-    : '';
+  const motif = tab.motif;
+  const motifGenomic =
+    m.genomicStart != null && m.genomicEnd != null && r.meta
+      ? `${escapeHtml(r.meta.chromosomeAccession)}:${m.genomicStart}-${m.genomicEnd} (${escapeHtml(
+          m.genomicStrand || ''
+        )})`
+      : '';
+  const target = renderTargetFasta(tab, r, m);
   return `<div class="match">
-    <div class="match-motif">domain/motif: <code>${escapeHtml(motif)}</code></div>
-    <div class="match-meta">${escapeHtml(r.taxon)} · pos ${m.position}–${m.end} (${m.position + 1} bp upstream of TSS)${meta ? ` · ${meta}` : ''}</div>
+    <div class="match-motif">binding site #${m.index} · motif <code>${escapeHtml(motif)}</code></div>
+    <div class="match-meta">${escapeHtml(r.taxon)} · ${escapeHtml(
+      formatRelPosition(m.relPositionFromTSS)
+    )} from TSS · pos ${m.position}–${m.end}${motifGenomic ? ` · ${motifGenomic}` : ''}</div>
     <div class="match-seq">${escapeHtml(m.contextBefore)}<mark>${escapeHtml(m.matched)}</mark>${escapeHtml(m.contextAfter)}</div>
     ${renderPrimers(m.primers || [])}
+    ${target}
+  </div>`;
+}
+
+function renderTargetFasta(tab: ExportTab, r: SpeciesResult, m: MotifMatch): string {
+  if (!r.meta || !r.promoterWindow) return '';
+  const win = buildTargetWindow(
+    r.promoterWindow,
+    m.position,
+    m.end,
+    EXPORT_TARGET_LEFT,
+    EXPORT_TARGET_RIGHT
+  );
+  const fasta = buildTargetFasta({
+    gene: tab.gene,
+    taxon: r.taxon,
+    motifLabel: tab.motif,
+    motifIndex: m.index,
+    match: m,
+    meta: r.meta,
+    sequence: win.sequence,
+    leftFlank: win.leftFlank,
+    rightFlank: win.rightFlank,
+    motifOffset: win.motifOffset,
+    motifLength: win.motifLength,
+  });
+  return `<div class="target-fasta-block">
+    <div class="target-fasta-title">Target sequence (${win.leftFlank}+${win.motifLength}+${win.rightFlank} bp · paste into Primer3Plus / Primer-BLAST)</div>
+    <pre class="target-fasta-pre">${escapeHtml(fasta)}</pre>
   </div>`;
 }
 
@@ -201,15 +327,20 @@ function renderSingleTab(tab: ExportTab): string {
     .map((r) =>
       r.error
         ? `${escapeHtml(r.taxon)}: lookup failed`
-        : `${escapeHtml(r.taxon)} ${r.matches.length}/${r.windowEnd.toLocaleString()}bp`
+        : `${escapeHtml(r.taxon)} ${r.matches.length} site${
+            r.matches.length === 1 ? '' : 's'
+          }/${r.windowEnd.toLocaleString()}bp`
     )
     .join(' · ');
   return `<section class="single">
     <header class="single-header">
       <div class="single-title">${escapeHtml(tab.gene)}</div>
-      <div class="single-sub">motif <code>${escapeHtml(tab.motif)}</code> · context ${tab.flankBefore}/${tab.flankAfter} bp</div>
+      <div class="single-sub">motif <code>${escapeHtml(tab.motif)}</code> · context ${tab.flankBefore}/${tab.flankAfter} bp · amplicon ${
+        tab.ampliconMin ?? 100
+      }–${tab.ampliconMax ?? 250} bp</div>
       <div class="single-sub muted">${speciesSummary}</div>
     </header>
+    ${renderBindingIndex(tab)}
     ${tab.results.map((r) => renderSingleSpecies(tab, r)).join('')}
   </section>`;
 }
@@ -240,17 +371,30 @@ function renderSingleSpecies(tab: ExportTab, r: SpeciesResult): string {
     </div>`;
   }
   return `<div class="species">
-    <h3>${escapeHtml(r.taxon)} — ${r.matches.length} match${r.matches.length === 1 ? '' : 'es'}</h3>
+    <h3>${escapeHtml(r.taxon)} — ${r.matches.length} binding site${r.matches.length === 1 ? '' : 's'}</h3>
     ${provenance}
     ${r.matches
-      .map(
-        (m) => `<div class="match wide">
-      <div class="match-motif">domain/motif: <code>${escapeHtml(tab.motif)}</code></div>
-      <div class="match-meta">pos ${m.position}–${m.end} (${m.position + 1} bp upstream of TSS) · ${escapeHtml(r.taxon)}</div>
-      <div class="match-seq">${escapeHtml(m.contextBefore)}<mark>${escapeHtml(m.matched)}</mark>${escapeHtml(m.contextAfter)}</div>
-      ${renderPrimers(m.primers || [])}
-    </div>`
-      )
+      .map((m) => {
+        const motifGenomic =
+          m.genomicStart != null && m.genomicEnd != null
+            ? `${escapeHtml(r.meta!.chromosomeAccession)}:${m.genomicStart}-${m.genomicEnd} (${escapeHtml(
+                m.genomicStrand || ''
+              )})`
+            : '';
+        return `<div class="match wide">
+        <div class="match-motif">binding site #${m.index} · motif <code>${escapeHtml(
+          tab.motif
+        )}</code></div>
+        <div class="match-meta">${escapeHtml(formatRelPosition(m.relPositionFromTSS))} from TSS · pos ${
+          m.position
+        }–${m.end}${motifGenomic ? ` · ${motifGenomic}` : ''} · ${escapeHtml(r.taxon)}</div>
+        <div class="match-seq">${escapeHtml(m.contextBefore)}<mark>${escapeHtml(
+          m.matched
+        )}</mark>${escapeHtml(m.contextAfter)}</div>
+        ${renderPrimers(m.primers || [])}
+        ${renderTargetFasta(tab, r, m)}
+      </div>`;
+      })
       .join('')}
   </div>`;
 }
@@ -404,6 +548,85 @@ function baseCss(): string {
   .species h3 { font-size: 10.5pt; margin: 0 0 4px; }
   .prov { font-size: 8pt; color: #555; margin-bottom: 4px; word-break: break-all; }
   .empty { color: #888; font-style: italic; font-size: 9pt; padding: 4px 0; }
+
+  /* Binding-site index list */
+  .binding-index {
+    background: #f4f4ef;
+    border: 1px solid #e2e2dc;
+    border-radius: 3px;
+    padding: 4px 8px;
+    margin: 4px 0 6px;
+  }
+  .binding-index-title {
+    font-size: 7.5pt;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #555;
+    font-weight: 600;
+    margin-bottom: 2px;
+  }
+  .binding-index ol {
+    margin: 0;
+    padding-left: 14px;
+    font-size: 7.5pt;
+    color: #444;
+    line-height: 1.4;
+  }
+
+  /* Compact target FASTA in exports */
+  .target-fasta-block {
+    margin-top: 4px;
+    border-top: 1px dashed #ddd;
+    padding-top: 3px;
+  }
+  .target-fasta-title {
+    font-size: 7pt;
+    color: #555;
+    margin-bottom: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .target-fasta-pre {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 6.5pt;
+    line-height: 1.3;
+    margin: 0;
+    padding: 3px 5px;
+    background: #fff;
+    border: 1px solid #e2e2dc;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .match.wide .target-fasta-pre { font-size: 7.5pt; }
+
+  /* Cross-tab summary table */
+  .summary {
+    padding: 6px 12px 12px;
+    page-break-after: always;
+    break-after: page;
+  }
+  .summary h2 {
+    font-size: 11pt;
+    margin: 0 0 6px;
+  }
+  .summary-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 8pt;
+  }
+  .summary-table th,
+  .summary-table td {
+    border: 1px solid #ddd;
+    padding: 3px 5px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .summary-table th {
+    background: #f0f0ec;
+    font-weight: 600;
+  }
+  .summary-table .cell-zero { color: #888; }
+  .summary-table .cell-warn { color: #b3261e; }
   `;
 }
 
