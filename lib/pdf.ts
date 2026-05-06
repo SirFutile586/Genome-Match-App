@@ -68,6 +68,7 @@ export function buildPrintHtml(tabs: ExportTab[]): string {
   .match .pos { display: block; font-family: inherit; color: #555; font-size: 8.5pt; margin-bottom: 2px; }
   mark { background: #ffe58a; padding: 0 1px; }
   .empty { color: #888; font-style: italic; font-size: 9.5pt; }
+  .prov { font-size: 8.5pt; color: #555; margin-bottom: 4px; word-break: break-all; }
   .print-actions { margin-bottom: 12px; }
   @media print { .print-actions { display: none; } }
   button {
@@ -100,15 +101,34 @@ function renderTab(tab: ExportTab): string {
 }
 
 function renderSpecies(r: SpeciesResult): string {
+  const provenance = r.meta
+    ? `<div class="prov">NCBI · ${escapeHtml(r.meta.assembly)} (${escapeHtml(
+        r.meta.assemblyAccession
+      )}) · transcript ${escapeHtml(r.meta.transcriptAccession)}${
+        r.meta.transcriptSelectCategory ? ` (${escapeHtml(r.meta.transcriptSelectCategory)})` : ''
+      }${r.meta.transcriptIsFallback ? ' [fallback]' : ''} · ${escapeHtml(
+        r.meta.chromosomeAccession
+      )}:${r.meta.upstreamGenomicStart}-${r.meta.upstreamGenomicEnd} · ${escapeHtml(
+        r.meta.strand
+      )} strand · TSS @ ${r.meta.tss}</div>`
+    : '';
+  if (r.error) {
+    return `<div class="species">
+      <h3>${escapeHtml(r.taxon)}</h3>
+      <div class="empty">Lookup failed: ${escapeHtml(r.error)}</div>
+    </div>`;
+  }
   if (!r.matches.length) {
     return `<div class="species">
       <h3>${escapeHtml(r.taxon)}</h3>
-      <div class="empty">No matches in 0–${r.windowEnd} bp.</div>
+      ${provenance}
+      <div class="empty">No matches in the ${r.windowEnd} bp upstream window.</div>
     </div>`;
   }
   return `<div class="species">
     <h3>${escapeHtml(r.taxon)} — ${r.matches.length} match${r.matches.length === 1 ? '' : 'es'}</h3>
-    ${r.matches.map(m => `<div class="match"><span class="pos">pos ${m.position}–${m.end} (0 bp = transcript 5' end)</span>${escapeHtml(m.contextBefore)}<mark>${escapeHtml(m.matched)}</mark>${escapeHtml(m.contextAfter)}</div>`).join('')}
+    ${provenance}
+    ${r.matches.map(m => `<div class="match"><span class="pos">pos ${m.position}–${m.end} (${m.position + 1}–${m.end} bp upstream of TSS)</span>${escapeHtml(m.contextBefore)}<mark>${escapeHtml(m.matched)}</mark>${escapeHtml(m.contextAfter)}</div>`).join('')}
   </div>`;
 }
 

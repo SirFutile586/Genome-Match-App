@@ -94,7 +94,6 @@ export default function SearchWorkspace() {
 
   const exportAll = useCallback(() => {
     if (!tabs.length) return;
-    // Snapshot the current tab state and hand it to the print-friendly route.
     const payload = encodeURIComponent(
       JSON.stringify(
         tabs.map((t) => ({
@@ -201,7 +200,7 @@ export default function SearchWorkspace() {
                 className={`subtab ${view === 'viewer' ? 'active' : ''}`}
                 onClick={() => setView('viewer')}
               >
-                Sequence viewer (0–10,000 bp)
+                Sequence viewer (0–10,000 bp upstream of TSS)
               </button>
             </div>
             <div className="sub" style={{ color: 'var(--ink-3)', fontSize: 12 }}>
@@ -211,7 +210,7 @@ export default function SearchWorkspace() {
           </div>
 
           {activeTab.warnings.length ? (
-            <div className="banner warn">{activeTab.warnings.join(' ')}</div>
+            <div className="banner warn">{activeTab.warnings.join(' · ')}</div>
           ) : null}
 
           {view === 'matches' ? (
@@ -220,23 +219,16 @@ export default function SearchWorkspace() {
             <ViewerView results={activeTab.results} motif={activeTab.motif} />
           )}
 
-          <div className="notes">
-            <div>
-              0 bp = transcript 5' end (this scaffold). Window is 0–10,000 bp upstream.
-            </div>
-            {activeTab.results[0]?.notes?.length ? (
-              <ul>
-                {activeTab.results[0].notes.map((n, i) => (
-                  <li key={i}>{n}</li>
-                ))}
-              </ul>
-            ) : null}
-          </div>
+          <SourceMetadata results={activeTab.results} />
         </div>
       ) : (
         <div className="empty-state" style={{ marginTop: 20 }}>
           <h2>No searches yet</h2>
           <p>Try gene <code>ST3GAL1</code> with motif <code>TTCnnnGAA</code> and 50 bp context. Each search opens a new tab.</p>
+          <p style={{ color: 'var(--ink-3)', fontSize: 12, marginTop: 8 }}>
+            Sequences are fetched live from NCBI Datasets + EFetch on every search; the first
+            request for a gene can take a few seconds.
+          </p>
         </div>
       )}
     </>
@@ -265,16 +257,23 @@ function MatchesView({ results }: { results: SpeciesResult[] }) {
           <h2>
             {r.taxon}
             <span className="count">
-              {r.matches.length} match{r.matches.length === 1 ? '' : 'es'} · source: {r.source}
+              {r.error
+                ? 'lookup failed'
+                : `${r.matches.length} match${r.matches.length === 1 ? '' : 'es'}`}
+              {r.meta ? ` · ${r.meta.assembly}` : ''}
             </span>
           </h2>
-          {r.matches.length === 0 ? (
-            <div className="empty-state">No matches in 0–{r.windowEnd} bp.</div>
+          {r.error ? (
+            <div className="empty-state">{r.error}</div>
+          ) : r.matches.length === 0 ? (
+            <div className="empty-state">
+              No matches in the {r.windowEnd.toLocaleString()} bp upstream window.
+            </div>
           ) : (
             r.matches.map((m, i) => (
               <div key={i} className="match-card">
                 <div className="meta">
-                  position {m.position}–{m.end} · {r.taxon}
+                  pos {m.position}–{m.end} ({m.position + 1}–{m.end} bp upstream of TSS) · {r.taxon}
                 </div>
                 <div className="seq">
                   {m.contextBefore}
@@ -298,23 +297,71 @@ function ViewerView({ results, motif }: { results: SpeciesResult[]; motif: strin
           <h2>
             {r.taxon}
             <span className="count">
-              0–{r.windowEnd} bp · {r.matches.length} highlighted match
-              {r.matches.length === 1 ? '' : 'es'}
+              {r.error
+                ? 'lookup failed'
+                : `0–${r.windowEnd.toLocaleString()} bp upstream · ${r.matches.length} highlighted match${
+                    r.matches.length === 1 ? '' : 'es'
+                  }`}
             </span>
           </h2>
-          <div className="viewer-header">
-            <span>
-              0 bp anchor: <strong>transcript 5' end</strong> · motif{' '}
-              <strong>{motif}</strong>
-            </span>
-            <span>length: {r.promoterWindow.length} bp</span>
-          </div>
-          <SequenceViewer
-            sequence={r.promoterWindow}
-            matches={r.matches.map((m) => [m.position, m.end])}
-          />
+          {r.error ? (
+            <div className="empty-state">{r.error}</div>
+          ) : (
+            <>
+              <div className="viewer-header">
+                <span>
+                  0 bp anchor: <strong>TSS of {r.meta?.transcriptAccession || 'canonical transcript'}</strong>
+                  {' · '}motif <strong>{motif}</strong>
+                </span>
+                <span>length: {r.promoterWindow.length.toLocaleString()} bp</span>
+              </div>
+              <SequenceViewer
+                sequence={r.promoterWindow}
+                matches={r.matches.map((m) => [m.position, m.end])}
+              />
+            </>
+          )}
         </section>
       ))}
     </>
+  );
+}
+
+function SourceMetadata({ results }: { results: SpeciesResult[] }) {
+  const anyMeta = results.some((r) => r.meta);
+  if (!anyMeta) return null;
+  return (
+    <div className="notes">
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>Sequence provenance</div>
+      <ul>
+        {results.map((r) =>
+          r.meta ? (
+            <li key={r.species}>
+              <strong>{r.taxon}:</strong> NCBI · {r.meta.assembly} ({r.meta.assemblyAccession}) ·{' '}
+              transcript <code>{r.meta.transcriptAccession}</code>
+              {r.meta.transcriptSelectCategory ? ` (${r.meta.transcriptSelectCategory})` : ''}
+              {r.meta.transcriptIsFallback ? ' [fallback]' : ''} ·{' '}
+              <code>
+                {r.meta.chromosomeAccession}:{r.meta.upstreamGenomicStart.toLocaleString()}–
+                {r.meta.upstreamGenomicEnd.toLocaleString()}
+              </code>{' '}
+              · {r.meta.strand} strand · TSS @ {r.meta.tss.toLocaleString()} · fetched{' '}
+              {new Date(r.meta.fetchedAt).toUTCString()}
+              {r.meta.fallbackReason ? (
+                <div style={{ color: 'var(--ink-3)', fontSize: 11, marginTop: 2 }}>
+                  ⚠ {r.meta.fallbackReason}
+                </div>
+              ) : null}
+            </li>
+          ) : null
+        )}
+      </ul>
+      <div style={{ color: 'var(--ink-3)', fontSize: 11, marginTop: 6 }}>
+        Position 0 bp anchors the canonical RefSeq transcript&apos;s TSS; index increases moving
+        upstream. The displayed sequence is the transcript-strand 10 kb upstream window (reverse
+        complemented for minus-strand genes by NCBI EFetch). Always verify the chosen transcript is
+        appropriate for your biological question — alternative TSSs may exist.
+      </div>
+    </div>
   );
 }
