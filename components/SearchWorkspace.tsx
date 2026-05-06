@@ -31,6 +31,14 @@ export default function SearchWorkspace() {
   const [view, setView] = useState<ViewMode>('matches');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [exportStatus, setExportStatus] = useState<
+    | { kind: 'idle' }
+    | { kind: 'starting' }
+    | { kind: 'opened' }
+    | { kind: 'blocked'; href: string }
+    | { kind: 'empty' }
+    | { kind: 'error'; message: string }
+  >({ kind: 'idle' });
 
   const activeTab = useMemo(
     () => tabs.find((t) => t.id === activeId) ?? null,
@@ -93,53 +101,105 @@ export default function SearchWorkspace() {
     [activeId]
   );
 
-  const buildPayload = (subset: Tab[]) =>
-    encodeURIComponent(
-      JSON.stringify(
-        subset.map((t) => ({
-          id: t.id,
-          gene: t.gene,
-          motif: t.motif,
-          flankBefore: t.flankBefore,
-          flankAfter: t.flankAfter,
-          results: t.results,
-        }))
-      )
+  const serializeTabs = (subset: Tab[]) =>
+    JSON.stringify(
+      subset.map((t) => ({
+        id: t.id,
+        gene: t.gene,
+        motif: t.motif,
+        flankBefore: t.flankBefore,
+        flankAfter: t.flankAfter,
+        results: t.results,
+      }))
     );
 
   const openPrint = useCallback((subset: Tab[]) => {
-    if (!subset.length) return;
-    // Use sessionStorage to avoid URL length issues with large payloads
-    // (10 kb windows × multiple species × multiple tabs would blow past
-    // typical URL limits). Pass a short token via the URL and stash the
-    // payload in sessionStorage on the same origin.
-    const token = `gm-print-${Date.now().toString(36)}`;
-    try {
-      const json = JSON.stringify(
-        subset.map((t) => ({
-          id: t.id,
-          gene: t.gene,
-          motif: t.motif,
-          flankBefore: t.flankBefore,
-          flankAfter: t.flankAfter,
-          results: t.results,
-        }))
-      );
-      sessionStorage.setItem(token, json);
-    } catch {
-      // sessionStorage may be disabled (private browsing). Fall back to URL.
-      const fallback = buildPayload(subset);
-      window.open(`/print?data=${fallback}`, '_blank', 'noopener');
+    if (typeof window === 'undefined') return;
+    if (!subset.length) {
+      setExportStatus({ kind: 'empty' });
       return;
     }
-    window.open(`/print?token=${token}`, '_blank', 'noopener');
+    setExportStatus({ kind: 'starting' });
+
+    const token = `gm-print-${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    const json = serializeTabs(subset);
+
+    // Persist to BOTH localStorage (shared across tabs on the same origin —
+    // works even when window.open is called with noopener which gives the
+    // popup a fresh sessionStorage) and sessionStorage (some hardened
+    // browsers proxy localStorage but allow sessionStorage). Clean up old
+    // entries so we don't leak large payloads.
+    let stored = false;
+    try {
+      // Best-effort cleanup of stale tokens (>30 min old).
+      const cutoff = Date.now() - 30 * 60 * 1000;
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const key = localStorage.key(i);
+        if (!key || !key.startsWith('gm-print-')) continue;
+        const parts = key.split('-');
+        const ts = parseInt(parts[2] || '', 36);
+        if (Number.isFinite(ts) && ts < cutoff) localStorage.removeItem(key);
+      }
+      localStorage.setItem(token, json);
+      stored = true;
+    } catch {
+      // ignored — try sessionStorage next
+    }
+    try {
+      sessionStorage.setItem(token, json);
+      stored = true;
+    } catch {
+      // ignored
+    }
+
+    const printUrl = `/print?token=${encodeURIComponent(token)}`;
+    // We intentionally do NOT pass 'noopener' — the print page calls
+    // window.print() and being able to access opener for a clean close is
+    // useful, plus omitting noopener helps with some popup blockers.
+    let popup: Window | null = null;
+    try {
+      popup = window.open(printUrl, '_blank');
+    } catch {
+      popup = null;
+    }
+
+    if (!popup || popup.closed || typeof popup.focus !== 'function') {
+      // Popup blocked. Surface a clickable fallback link the user can
+      // activate themselves (their click counts as a user gesture).
+      setExportStatus({ kind: 'blocked', href: printUrl });
+      if (!stored) {
+        // Even fallback won't have data — encode small payload in URL hash
+        // as last resort (fits ~2MB on modern browsers, but may still fail
+        // for very large multi-tab exports).
+        try {
+          const hashUrl = `/print#data=${encodeURIComponent(json)}`;
+          setExportStatus({ kind: 'blocked', href: hashUrl });
+        } catch (e) {
+          setExportStatus({ kind: 'error', message: (e as Error).message });
+        }
+      }
+      return;
+    }
+    try {
+      popup.focus();
+    } catch {
+      // some browsers throw on cross-origin focus, ignore
+    }
+    setExportStatus({ kind: 'opened' });
   }, []);
 
   const exportAll = useCallback(() => openPrint(tabs), [tabs, openPrint]);
   const exportCurrent = useCallback(() => {
-    if (!activeTab) return;
+    if (!activeTab) {
+      setExportStatus({ kind: 'empty' });
+      return;
+    }
     openPrint([activeTab]);
   }, [activeTab, openPrint]);
+
+  const dismissExportStatus = useCallback(() => setExportStatus({ kind: 'idle' }), []);
 
   return (
     <>
@@ -204,6 +264,8 @@ export default function SearchWorkspace() {
       <MotifHelp />
 
       {error ? <div className="banner warn" style={{ marginTop: 12 }}>{error}</div> : null}
+
+      <ExportStatusBanner status={exportStatus} onDismiss={dismissExportStatus} />
 
       <div className="tabs" role="tablist">
         {tabs.map((t) => (
@@ -276,6 +338,80 @@ export default function SearchWorkspace() {
         </div>
       )}
     </>
+  );
+}
+
+interface ExportStatus {
+  kind: 'idle' | 'starting' | 'opened' | 'blocked' | 'empty' | 'error';
+}
+function ExportStatusBanner({
+  status,
+  onDismiss,
+}: {
+  status:
+    | { kind: 'idle' }
+    | { kind: 'starting' }
+    | { kind: 'opened' }
+    | { kind: 'blocked'; href: string }
+    | { kind: 'empty' }
+    | { kind: 'error'; message: string };
+  onDismiss: () => void;
+}) {
+  if (status.kind === 'idle') return null;
+  if (status.kind === 'starting') {
+    return (
+      <div className="banner" style={{ marginTop: 12 }} data-testid="export-status">
+        Preparing export…
+      </div>
+    );
+  }
+  if (status.kind === 'opened') {
+    return (
+      <div className="banner" style={{ marginTop: 12 }} data-testid="export-status">
+        Export view opened in a new tab. Use the button there to print or save as PDF.{' '}
+        <button className="btn ghost" style={{ height: 'auto', padding: '0 6px' }} onClick={onDismiss}>
+          dismiss
+        </button>
+      </div>
+    );
+  }
+  if (status.kind === 'empty') {
+    return (
+      <div className="banner warn" style={{ marginTop: 12 }} data-testid="export-status">
+        Nothing to export — run a search first.{' '}
+        <button className="btn ghost" style={{ height: 'auto', padding: '0 6px' }} onClick={onDismiss}>
+          dismiss
+        </button>
+      </div>
+    );
+  }
+  if (status.kind === 'blocked') {
+    return (
+      <div className="banner warn" style={{ marginTop: 12 }} data-testid="export-status">
+        Your browser blocked the export pop-up.{' '}
+        <a
+          href={status.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-testid="export-fallback-link"
+          style={{ color: '#6a4a00', fontWeight: 600, textDecoration: 'underline' }}
+        >
+          Click here to open the export view
+        </a>{' '}
+        — your click will count as a user action and bypass the blocker.{' '}
+        <button className="btn ghost" style={{ height: 'auto', padding: '0 6px' }} onClick={onDismiss}>
+          dismiss
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="banner warn" style={{ marginTop: 12 }} data-testid="export-status">
+      Export failed: {status.message}.{' '}
+      <button className="btn ghost" style={{ height: 'auto', padding: '0 6px' }} onClick={onDismiss}>
+        dismiss
+      </button>
+    </div>
   );
 }
 
